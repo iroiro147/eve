@@ -436,6 +436,34 @@ interface TurnTraceState {
   readonly traceFlags: number;
 }
 
+/**
+ * Live turn spans, keyed by their span context, so the recording turn root
+ * can stay open across the in-process tool-loop steps of one turn. Only the
+ * span's serializable context flows through `session.state`; a detached
+ * `trace.wrapSpanContext` parent references an already-ended span, and
+ * exporters that drop spans outliving their finished transaction root
+ * (e.g. Sentry's default span processor) then silently lose every step
+ * after the first. The registry is process-local: a turn resuming on a
+ * different worker finds no entry and falls back to the detached parent.
+ */
+const liveTurnSpans = new Map<string, Span>();
+
+function liveTurnSpanKey(state: {
+  readonly spanId: string;
+  readonly traceId: string;
+}): string {
+  return `${state.traceId}:${state.spanId}`;
+}
+
+function registerLiveTurnSpan(span: Span): void {
+  liveTurnSpans.set(liveTurnSpanKey(span.spanContext()), span);
+}
+
+function endLiveTurnSpan(span: Span): void {
+  liveTurnSpans.delete(liveTurnSpanKey(span.spanContext()));
+  span.end();
+}
+
 function getTurnTraceState(session: {
   readonly state?: Readonly<Record<string, unknown>>;
 }): TurnTraceState | undefined {
@@ -459,30 +487,47 @@ function setTurnTraceState(session: HarnessSession, spanContext: SpanContext): H
 }
 
 /**
+ * Resolved OTel root for one step. `liveSpan` is the recording turn span
+ * whenever one is open in this process: the span just started for the
+ * turn's first step, or the span that step left open and this continuation
+ * step re-adopted via {@link liveTurnSpans}.
+ */
+interface StepOtelRoot {
+  readonly context: ReturnType<typeof otelContext.active>;
+  readonly liveSpan?: Span;
+}
+
+/**
  * Resolves the OTel context for the current step.
  *
  * First step of a turn: uses the newly created turn span.
- * Continuation steps: restores the parent span context from session state
- * so AI SDK spans nest under the same trace as the first step.
+ * Continuation steps: re-adopts the still-open turn span when it lives in
+ * this process, so every step's spans end before their root. When the live
+ * span is unavailable (the turn resumed on another worker), restores the
+ * parent span context from session state as a detached parent so AI SDK
+ * spans at least stay on the same trace as the first step.
  */
 function resolveStepOtelContext(
   tracer: ReturnType<typeof trace.getTracer> | undefined,
   turnSpan: Span | undefined,
   session: { readonly state?: Readonly<Record<string, unknown>> },
-): ReturnType<typeof otelContext.active> | undefined {
+): StepOtelRoot | undefined {
   if (turnSpan) {
-    return trace.setSpan(otelContext.active(), turnSpan);
+    return { context: trace.setSpan(otelContext.active(), turnSpan), liveSpan: turnSpan };
   }
 
   if (tracer) {
     const stored = getTurnTraceState(session);
     if (stored) {
-      const parent = trace.wrapSpanContext({
-        traceId: stored.traceId,
-        spanId: stored.spanId,
-        traceFlags: stored.traceFlags,
-      });
-      return trace.setSpan(otelContext.active(), parent);
+      const liveSpan = liveTurnSpans.get(liveTurnSpanKey(stored));
+      const parent =
+        liveSpan ??
+        trace.wrapSpanContext({
+          traceId: stored.traceId,
+          spanId: stored.spanId,
+          traceFlags: stored.traceFlags,
+        });
+      return { context: trace.setSpan(otelContext.active(), parent), liveSpan };
     }
   }
 
@@ -538,6 +583,7 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
         attributes["ai.telemetry.functionId"] = functionId;
       }
       turnSpan = tracer.startSpan("ai.eve.turn", { attributes });
+      registerLiveTurnSpan(turnSpan);
     }
 
     // Run the step body inside the turn span's (or restored parent's)
@@ -545,13 +591,23 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
     const parentContext = resolveStepOtelContext(tracer, turnSpan, initialSession);
     const executeStep = () => executeStepBody(initialSession, input, turnSpan);
 
+    const turnRootSpan = parentContext?.liveSpan;
+    let keepTurnSpanOpen = false;
     try {
+      let result: StepResult;
       if (parentContext) {
-        return await otelContext.with(parentContext, executeStep);
+        result = await otelContext.with(parentContext.context, executeStep);
+      } else {
+        result = await executeStep();
       }
-      return await executeStep();
+      // A tool-loop continuation (`next: runStep`) resumes the turn inline:
+      // keep the turn root open so every step's spans end before it does.
+      keepTurnSpanOpen = typeof result.next === "function";
+      return result;
     } finally {
-      turnSpan?.end();
+      if (!keepTurnSpanOpen && turnRootSpan) {
+        endLiveTurnSpan(turnRootSpan);
+      }
     }
   }
 
@@ -564,6 +620,8 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
 
     // Store the turn span context on the session so continuation steps
     // can restore the parent trace across step boundaries.
+    // The live span itself flows through {@link liveTurnSpans}; only its
+    // serializable context rides the session.
     if (turnSpan) {
       session = setTurnTraceState(session, turnSpan.spanContext());
     }
